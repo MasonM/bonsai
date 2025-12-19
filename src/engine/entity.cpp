@@ -908,6 +908,51 @@ UpdateEntityP(world* World, entity *Entity, v3 Delta)
   Canonicalize(World, &Entity->P);
 }
 
+collision_event
+GetCollision(cp EntityP, u64 *EntityOccupancy, octree_node *Node)
+{
+  HISTOGRAM_FUNCTION();
+
+  collision_event Result = {};
+
+  s32 xShift = s32(EntityP.Offset.x);
+  s32 yStart = s32(EntityP.Offset.y);
+  s32 zStart = s32(EntityP.Offset.z);
+
+  s32 zEntIndex = 0;
+  for (s32 zIndex = zStart; zIndex < 64; ++zIndex)
+  {
+
+    s32 yEntIndex = 0;
+    for (s32 yIndex = yStart; yIndex < 64; ++yIndex)
+    {
+      s32 WorldOccIndex = GetIndex(yIndex, zIndex, V2i(64));
+      u64 WorldOcc = GetOccupancyMask(Node->Chunk->Occupancy, WorldOccIndex);
+
+      s32 EntityOccIndex = GetIndex(yEntIndex, zEntIndex, V2i(64));
+      u64 EntityOcc = GetOccupancyMask(EntityOccupancy, EntityOccIndex);
+
+      u64 Collision = WorldOcc & EntityOcc;
+
+      if (Collision)
+      {
+        u32 xOffset = GetIndexOfNthSetBit(Collision, 1);
+        Result.FrameIndex = 1;
+        Result.Count = 1;
+        Result.MinP = Canonical_Position(V3(s32(xOffset), yIndex, zIndex), Node->WorldP );
+        Result.MaxP = Canonical_Position(V3(s32(xOffset), yIndex, zIndex), Node->WorldP );
+
+        return Result;
+      }
+
+      ++yEntIndex;
+    }
+
+    ++zEntIndex;
+  }
+  return Result;
+}
+
 link_internal collision_event
 MoveEntityInWorld(world* World, entity *Entity, v3 GrossDelta)
 {
@@ -920,13 +965,48 @@ MoveEntityInWorld(world* World, entity *Entity, v3 GrossDelta)
 
   v3 CollisionVolumeInit = Entity->_CollisionVolumeRadius*2.0f;
   collision_event Result = {};
-  collision_event C      = GetCollision(World, Entity->P, CollisionVolumeInit);
+  collision_event C      = {}; //GetCollision(World, Entity->P, CollisionVolumeInit);
+                               // TODO(Jesse): Should we still do this? ^
 
 
   v3 Signs = GetSign(GrossDelta);
   v3 AbsDelta  = Abs(GrossDelta);
   v3 Remaining = Abs(GrossDelta);
 
+
+  cp SrcMin = Entity->P;
+  cp SrcMax = Canonicalize(World, Entity->P + V3(64));
+
+  cp DestMin = Canonicalize(World, SrcMin + GrossDelta);
+  cp DestMax = Canonicalize(World, SrcMax + GrossDelta);
+
+
+
+  cp MinP = Min(SrcMin, DestMin);
+  cp MaxP = Max(SrcMax, DestMax);
+
+  octree_node_ptr_block_array Nodes = OctreeNodePtrBlockArray(GetTranArena());
+  rect3cp Region = RectMinMax(MinP, MaxP);
+  GatherOctreeNodesOverlapping_Recursive(World, &World->Root, &Region, &Nodes);
+
+  asset *Asset = GetAssetPtr(GetEngineResources(), &Entity->AssetId).Value;
+  Assert(Asset);
+
+  model *Model = GetModel(Asset, &Entity->AssetId, Entity->ModelIndex);
+  Assert(Model);
+
+
+#if 1
+  {
+    IterateOver(&Nodes, Node, NodeIndex)
+    {
+      if (Node->Resolution > V3i(1)) continue;
+
+      Info("Colliding Against (%d,%d,%d)", Node->WorldP.x, Node->WorldP.y, Node->WorldP.z );
+    }
+    Info("--");
+  }
+#endif
 
   // NOTE(Jesse): Don't move the entity if it's already stuck in the world
   if (C.Count)
@@ -937,6 +1017,79 @@ MoveEntityInWorld(world* World, entity *Entity, v3 GrossDelta)
   }
   else
   {
+
+    v3 rayPos = {};
+    v3 rayDir = Normalize(GrossDelta);
+
+    // https://www.shadertoy.com/view/4dX3zl
+    v3i mapPos = V3i(Floor(rayPos + 0.));
+
+    v3 deltaDist = Abs( SafeDivideValue(V3(Length(rayDir)), rayDir, V3(f32_MAX)) );
+    v3i rayStep = V3i(GetSign(rayDir));
+
+    v3 sideDist_ = (GetSign(rayDir) * (V3(mapPos) - rayPos) + (GetSign(rayDir) * 0.5) + 0.5);
+    v3 sideDist = sideDist_ * deltaDist;
+
+    v3i mask = {};
+
+    /* v3i Remaining = GrossDelta; */
+    while (Remaining.x > 0.f || Remaining.y > 0.f || Remaining.z > 0.f)
+    {
+      v3 yzx = V3(sideDist.y, sideDist.z, sideDist.x);
+      v3 zxy = V3(sideDist.z, sideDist.x, sideDist.y);
+
+      // All components of mask are false except for the corresponding largest component
+      // of sideDist, which is the axis along which the ray should be incremented.
+      mask.x = sideDist.x <= Min(yzx.x, zxy.x);
+      mask.y = sideDist.y <= Min(yzx.y, zxy.y);
+      mask.z = sideDist.z <= Min(yzx.z, zxy.z);
+
+      sideDist += V3(mask) * deltaDist;
+
+      v3i step = mask * rayStep;
+      mapPos += step;
+      Remaining += V3(step);
+
+      if (mapPos.x >= 64) break;
+      if (mapPos.y >= 64) break;
+      if (mapPos.z >= 64) break;
+
+      Entity->P.Offset += V3(step);
+      Canonicalize(World, &Entity->P);
+
+      IterateOver(&Nodes, Node, NodeIndex)
+      {
+        if (Node->Resolution > V3i(1)) continue;
+        if (Node->Chunk)
+        {
+          auto NodeAABB = GetBoundingBox(World, Node);
+          cp EP0 = Canonicalize(World, Entity->P);
+          cp EP1 = Canonicalize(World, Entity->P + V3(64));
+          rect3cp ERect = RectMinMax(EP0, EP1);
+          if (Intersect(World, &ERect, &NodeAABB))
+          {
+            Result = GetCollision(Entity->P, Model->Gen->Chunk.Occupancy, Node);
+            if (Result.Count)
+            {
+              Entity->P.Offset -= V3(step);
+              Canonicalize(World, &Entity->P);
+
+              auto InvMask = V3(Abs(mask-1.f));
+              Entity->Physics.Velocity *= InvMask;
+              Entity->Physics.Delta *= InvMask;
+              return Result;
+            }
+          }
+        }
+      }
+
+      /* s32 Index = GetIndex(mapPos, V3i(64)); */
+      /* SetOccupancyBit(&Gen->Chunk, Index, 1); */
+      /* ++Gen->FilledCount; */
+    }
+
+
+#if 0
     while (LengthSq(Remaining) > 0)
     {
       v3 StepDelta = Min(Normalize(Remaining), Remaining);
@@ -1049,6 +1202,7 @@ MoveEntityInWorld(world* World, entity *Entity, v3 GrossDelta)
 
       if (Unspawned(Entity) || Destroyed(Entity)) break;
     }
+#endif
   }
 
   Entity->P = Canonicalize(WorldChunkDim, Entity->P);
